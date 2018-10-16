@@ -1,0 +1,5 @@
+set log=.\auto_install.log
+date /T >%log%
+time /T >>%log%
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\auto_local.ps1 2>&1 >>%log%
+time /T >>%log%

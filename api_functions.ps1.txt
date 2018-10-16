@@ -1,0 +1,132 @@
+$global:apiToken = ""
+$global:apiSuccess = $true
+$global:apiStatusCode = ""
+$global:apiStatusMessage = ""
+$global:apiResponse = ""
+$global:apiExitCode = 0
+
+
+FUNCTION apiFatalError($message)
+{
+    write-host "$(get-date) API Fatal Error: $message"
+    $global:apiExitCode = 1
+    exit
+}
+
+
+FUNCTION apiLogin($user, $pw) {
+    $url = "$global:apiUrl/TestDataManager/user/login" 
+    $enc_user_pw = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("${user}:$pw"))
+    $headers = @{Authorization = "Basic $enc_user_pw"}
+
+    # Timeout after 10 mins if service has not started
+    write-host "Waiting for TDMPortal service to start"
+
+    try {
+        write-host "POST $url" 
+        $global:apiResponse = invoke-restmethod $url -TimeoutSec 600 -Method Post -ContentType $global:apiContentType -Headers $headers
+        $global:apiSuccess = $true
+        $global:apiStatCode = ""
+        $global:apiStatusMessage = ""
+        write-host "Response: Success"
+
+        $global:apiToken = $global:apiResponse.token
+    }
+    catch {
+        $global:apiSuccess = $false
+        $global:apiStatusCode = $_.Exception.Response.StatusCode.value__
+        if ($global:apiStatusCode -ne "") {
+            $global:apiStatusMessage = "$_.Exception.Response.StatusDescription"
+        }
+        else {
+            $global:apiStatusCode = "-1"
+            $global:apiStatusMessage = "$_.Exception"
+        }
+        write-host "Response: $global:apiStatusCode $global:apiStatusMessage"  
+    }
+}
+
+
+FUNCTION apiCall($method, $uri, $body, $contentType, $silent) {
+    $url = "$global:apiUrl/$uri"                  
+    $headers = @{Authorization = "Bearer $global:apiToken"}
+
+    if ($null -eq $contentType) {
+        $contentType = "application/json;charset=UTF-8"
+        $body = $body | ConvertTo-Json -Depth 5
+    }
+
+    try {
+        if ($null -eq $silent) {
+            write-host "$method $url" 
+        }
+        if ($null -eq $body) {
+            $global:apiResponse = invoke-restmethod $url -Method $method -ContentType $contentType -Headers $headers
+        }
+        else {
+            $global:apiResponse = invoke-restmethod $url -Method $method -ContentType $contentType -Headers $headers -Body "$body" -ErrorVariable RestError
+        }
+        # Note: Powershell hides the status code from a successful REST call so we can't return it! 
+        $global:apiSuccess = $true
+        $global:apiStatusCode = ""
+        $global:apiStatusMessage = ""
+        if ($null -eq $silent) {
+            write-host "Response: Success"
+        }
+    }
+    catch {
+        $global:apiSuccess = $false
+        $global:apiStatusCode = $_.Exception.Response.StatusCode.value__
+        if ($global:apiStatusCode -ne "") {
+            $global:apiStatusMessage = $_.Exception.Response.StatusDescription
+        }
+        else {
+            $global:apiStatusCode = "-1"
+            $global:apiStatusMessage = $_.Exception
+        }
+        write-host "Response: $global:apiStatusCode $global:apiStatusMessage"  
+    }
+}
+
+
+FUNCTION apiGet($uri, $silent) {
+    apiCall GET $uri $null $null $silent
+}
+
+
+FUNCTION apiPost($uri, $body) {
+    if ($null -eq $body) {
+        $body = @{}
+    }
+    apiCall POST $uri $body
+}
+
+
+FUNCTION apiPostForm($uri, $body) {
+    $boundary = [System.Guid]::NewGuid().ToString()
+    $body = $body | ConvertTo-Json
+    
+    $LF = "`r`n"
+    $formBody = (
+        "--$boundary",
+        "Content-Disposition: form-data; name=`"body`"; filename=`"blob`"",
+		    "Content-Type: application/json$LF",
+        "$body",
+        "--$boundary--$LF"
+     ) -join $LF
+
+    apiCall POST $uri $formBody "multipart/form-data;boundary=$boundary"
+}
+
+
+FUNCTION apiPut($uri, $body) {
+    if ($null -eq $body) {
+        $body = @{}
+    }
+    apiCall PUT $uri $body
+}
+
+
+FUNCTION apiDelete($uri) {
+    apiCall DELETE $uri
+}

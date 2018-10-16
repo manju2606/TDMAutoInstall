@@ -1,0 +1,341 @@
+. $global:auto_install_dir\auto_install_credentials.ps1
+
+$global:isOracle = $false
+$global:isOracle12c = $false
+
+FUNCTION commonAutoInstallStart()
+{
+    $progress = get-childitem $global:desktop -filter $global:progress_filter
+    if ($null -ne $progress) {
+        write-host Auto Install has already run
+        exit
+    }
+    
+    start-transcript -path "$global:auto_install_dir\auto_install.log" -append
+
+    write-host $(get-date) Auto Install starting
+    copy-item $global:boot\$global:progress_running $global:desktop
+    
+    if (!(test-path $global:auto_install_dir)) {
+        write-host Auto Install cancelled due to missing local folder: $global:auto_install_dir
+        commonAutoInstallFail
+    }
+}
+
+
+FUNCTION commonAutoInstallFail()
+{
+    write-host $(get-date) Auto Install failed
+    remove-item $global:desktop\$global:progress_running
+    copy-item $global:boot\$global:progress_failed $global:desktop
+    stop-transcript
+    exit
+}
+
+
+FUNCTION commonAutoInstallComplete()
+{
+    write-host $(get-date) Auto Install complete
+    
+    write-host ---------------------
+    write-host Auto Install finished
+    write-host ---------------------
+    remove-item $global:desktop\$global:progress_running
+    copy-item $global:boot\$global:progress_complete $global:desktop
+    if (!${global:vmProperties}.install_local.Contains("true")) {
+	    move-item $global:bootstrap\Auto_Install.bat $global:bootstrap\Auto_Install.complete.bat -ErrorAction SilentlyContinue 
+	}
+    stop-transcript
+    exit
+}
+
+
+FUNCTION commonRunProcess($exe, $argList)
+{
+    write-host "$(get-date) Running $exe $argList"
+    $process = start-process "$exe" -WindowStyle hidden -Wait -PassThru -Verb "RunAs" -ArgumentList $argList
+    $global:exitCode = $process.ExitCode 
+}
+
+
+FUNCTION commonLookForOracle()
+{
+    write-host "Looking for Oracle .."
+    $global:isOracle = $false
+
+    # Does sqlplus command exist?
+    if (!(Get-Command "sqlplus.exe" -ErrorAction SilentlyContinue)) {
+        return
+    }
+
+    # Update Oracle network file
+    $listener = "C:\app\Admin\product\12.1.0\dbhome_1\NETWORK\ADMIN\listener.ora"
+    $global:isOracle12c = $true
+    
+    # Might be Oracle 11g instead of 12c
+    if (!(test-path $listener)) {
+        $listener = "C:\app\Admin\product\11.2.0\dbhome_1\NETWORK\ADMIN\listener.ora"
+        $global:isOracle12c = $false
+    }
+
+    if ($global:isOracle12c) {
+        write-host "Oracle version is 12c"
+        $service = "OracleOraDB12Home1TNSListener" 
+    }
+    else {
+        write-host "Oracle version is 11g"
+        $service = "OracleOraDb11g_home1TNSListener" 
+    }
+    
+    (Get-Content "$listener") -replace("\(HOST = .*?\)","(HOST = $env:computername)") | Set-Content "$listener"
+    
+    # Restart Oracle listener
+    Restart-Service $service
+    
+    # wait for Oracle to respond
+    $exit = "$global:auto_install_dir\exit.sql"
+    Set-Content "$exit" "EXIT"
+    $connection = "system/$global:oracle_system_password@$env:computername/$global:oracle_service" 
+    $argList = "-L","$connection","@$exit"
+    write-host "Trying to connect to Oracle: $connection"
+    for ($i = 0; $i -lt 15; $i++) {
+        commonRunProcess sqlplus $argList
+        if ($global:exitCode -eq 0) {
+            $global:isOracle = $true
+            return
+        }
+        start-sleep -s 5
+    }
+    
+    write-host "Failed to connect to Oracle: $connection"
+    commonAutoInstallFail
+}
+
+
+FUNCTION commonCreateDb($db)
+{
+    $repo_cmd = "./ca-tdm-db-installer.exe"
+    
+    if ($global:isOracle) {
+        write-host Creating Oracle database: $db
+        write-host '<---'
+        & $repo_cmd install --server $global:server --servicename $global:oracle_service -dbname $db --dbms oracle --dbmsuser system --dbmspassword $global:oracle_system_password --dbpassword $global:gtrep_password 2>&1 | Write-Output
+        write-host ' --->'
+    }
+    else {
+        write-host Creating SQL Server database: $db
+        write-host '<---'
+	    & $repo_cmd install --server $global:server --dbname $db --dbms sqlserver --dbmsuser sa --dbmspassword $global:sqlserver_sa_password --dbuser gtrep --dbpassword $global:gtrep_password 2>&1 | Write-Output
+        write-host ' --->'
+    }
+
+    if ($LastExitCode -ne 0) {
+        write-host Repo Kit installer failed - Please see repo kit logfile for details
+        commonAutoInstallFail
+    }
+}
+
+
+FUNCTION commonRunDbScript($script)
+{
+    if ($global:isOracle) {
+        write-host Executing Oracle database script: $script
+        write-host '<---'
+        & echo @$script | sqlplus -L system/$global:oracle_system_password@$global:server/$global:oracle_service 2>&1 | Write-Output
+        write-host ' --->'
+    }
+    else {
+        write-host Executing SQL Server database script: $script
+        write-host '<---'
+	      & sqlcmd -U sa -P $global:sqlserver_sa_password -S $global:server -i $script 2>&1 | Write-Output
+        write-host ' --->'
+    }
+}
+
+FUNCTION commonGetRepoKit($latest_zip, $repo_zip, $working_dir)
+{
+    write-host Repo Kit is $latest_zip
+    write-host Copying $repo_zip to $working_dir
+    copy-item $repo_zip $working_dir
+    $repo_zip = "$working_dir\$latest_zip"
+
+    # Get required files from zip
+    $shell = New-Object -ComObject shell.application
+    $zip = $shell.NameSpace($repo_zip)
+    foreach ($item in $zip.items()) {
+        if ($item.Name -eq "Oracle_Install_Kit" -Or $item.Name -eq "SQL_Server_Install_Kit") {
+            write-host Ignoring zip item: $item.Name
+        }
+        else {
+            write-host Unzipping item: $item.Name
+            $shell.Namespace($working_dir).CopyHere($item)
+        }
+    }
+}
+
+FUNCTION commonInstallRepoKit($repo_kit)
+{
+    if ($global:isOracle) {
+        write-host Installing Oracle repo kit to $global:server/$global:oracle_service with system password: $global:oracle_system_password
+    }
+    else {
+        write-host Installing SQL Server repo kit to $global:server with sa password: $global:sqlserver_sa_password
+    }
+    $repo_cmd = "$repo_kit\ca-tdm-db-installer.exe"
+    if (!(test-path $repo_cmd)) {
+        write-host Repo Kit Install cancelled due to missing exe: $repo_cmd
+        commonAutoInstallFail
+    }
+
+    cd $repo_kit
+    commonCreateDb gtrep
+    commonCreateDb creditcard
+    commonCreateDb creditcard_e
+    commonCreateDb travel
+    commonCreateDb travel_e
+    commonCreateDb orders
+    commonCreateDb orders_e
+    commonCreateDb scramble
+}
+
+
+FUNCTION commonInstallSetup($working_dir, $name)
+{
+    $exe = "$working_dir\setup_$name.exe"
+    $log = "$working_dir\setup_$name.log"
+    $argList = "/quiet","/L*V $log","APPDIR=C:\$name" 
+    commonRunProcess "$exe" $argList
+}
+
+# $setup is now the full path!
+FUNCTION commonInstallGTServer($working_dir, $setup)
+{
+    write-host $(get-date) GTServer is $setup
+
+    if ($global:isOracle) {
+        write-host "To connect to Oracle in DataMaker use the following EZConnect string:"
+        write-host "  //${env:computername}:1521/orcl.ca.com"
+        write-host '  User ID: gtrep  Password: gtsecret$123'
+    }
+    else {
+        # Add a gtrep ODBC connection to use in DataMaker
+        write-host Adding gtrep SQL Server ODBC connection
+        Add-OdbcDsn -Name "gtrep" -DriverName "SQL Server Native Client 11.0" -DsnType "User" -Platform "32-bit" -SetPropertyValue @("Server=$global:server", "Trusted_Connection=No", "Database=gtrep")
+    }
+
+    # Extract all installers from GTServer
+    $argList = ,"/extract " + $working_dir 
+    commonRunProcess "$setup" $argList
+
+    if ($global:isOracle) {
+        # Pre-reqs fail to install if Oracle services are running!
+        if ($global:isOracle12c) {
+            Stop-Service OracleOraDB12Home1TNSListener
+            Stop-Service OracleOraDB12Home1MTSRecoveryService
+            Stop-Service OracleVssWriterORCL
+            Stop-Service OracleServiceORCL
+        }
+        else {
+            Stop-Service OracleOraDb11g_home1TNSListener
+            Stop-Service OracleDBConsoleorcl
+            Stop-Service OracleServiceORCL
+        }
+    }
+    
+    # Install pre-reqs
+    $jre_filter = "jre-*x64.exe"
+    $jre = get-childitem $working_dir -filter $jre_filter | select -first 1
+    $argList = ,"/s"
+    commonRunProcess "$working_dir\$jre" $argList
+    $argList = ,"/q /norestart"
+    commonRunProcess "$working_dir\Visual C++ 2010 SP1\vcredist_x86.exe" $argList
+    commonRunProcess "$working_dir\Visual C++ 2010 SP1\vcredist_x64.exe" $argList
+    commonRunProcess "$working_dir\Visual C++ Redistributable for Visual Studio 2012\vcredist_x86.exe" $argList
+    commonRunProcess "$working_dir\Visual C++ Redistributable for Visual Studio 2012\vcredist_x64.exe" $argList    
+	
+	$argList = ,"/quiet"
+
+    if ($global:isOracle) {
+         # Restart all Oracle services
+        if ($global:isOracle12c) {
+            Start-Service OracleServiceORCL
+            Start-Service OracleVssWriterORCL
+            Start-Service OracleOraDB12Home1MTSRecoveryService
+            Start-Service OracleOraDB12Home1TNSListener
+        }
+        else {
+            Start-Service OracleServiceORCL
+            Start-Service OracleDBConsoleorcl
+            Start-Service OracleOraDb11g_home1TNSListener
+        }
+    }
+
+    # Install setups
+    commonInstallSetup "$working_dir" datamaker31
+    commonInstallSetup "$working_dir" FastDataMasker_trial
+    commonInstallSetup "$working_dir" GTALMBatch
+    commonInstallSetup "$working_dir" GTALMService
+    commonInstallSetup "$working_dir" GTEDI
+    commonInstallSetup "$working_dir" GTGroupJobProcessor
+    commonInstallSetup "$working_dir" GTPortusJobProcessor
+    commonInstallSetup "$working_dir" GTRallyBatch
+    commonInstallSetup "$working_dir" Javelin
+    commonInstallSetup "$working_dir" RemotePublish
+    commonInstallSetup "$working_dir" TestDataVisualizer
+
+	write-host $(get-date) GTServer install finished
+	
+	$argList = ,"/qn"
+	commonRunProcess "$working_dir\setup_odp4net_4.112.3.0.exe" $argList
+	write-host $(get-date) Installed Oracle Data Provider for DotNet ODP4Net
+	
+	$argList = ,"/qn IACCEPTSQLNCLILICENSETERMS=YES"
+	commonRunProcess "$working_dir\SQL Server Native Client 2012\sqlncli_amd64.msi" $argList
+	write-host $(get-date) Installed SQL Server Native Client 2012
+
+	$argList = ,"/q"
+	commonRunProcess "$working_dir\Silverlight 5\Silverlight_x64.exe" $argList
+	write-host $(get-date) Installed Silverlight 5
+	
+	$argList = ,"/q /norestart"
+	commonRunProcess "$working_dir\.NET Framework 4.5.2\NDP452-KB2901907-x86-x64-AllOS-ENU.exe" $argList
+	write-host $(get-date) Installed .NET Framework 4.5.2
+	
+	# Post GT Server Installation 
+	write-host $(get-date) Post GTServer install started
+	$argList = ,"/quiet APPDIR=C:\TestDataonDemand\"
+	commonRunProcess "$working_dir\setup_TDoD.exe" $argList
+	write-host $(get-date) Installed TDoD
+	
+    write-host $(get-date) Post GTServer install finished
+}
+
+
+# $setup is now the full path!
+FUNCTION commonInstallPortal($working_dir, $setup)
+{
+    write-host $(get-date) TDMPortal is $setup
+
+    $setup_cmd = "$setup"
+    $logfile = "$working_dir\portal_install.log"
+    if ($global:isOracle) {
+        $paramsfile = "portal_install_oracle.params"
+    }
+    else {
+        $paramsfile = "portal_install_sqlserver.params"
+    }
+    $portalParams = get-content "$global:auto_install_dir\$paramsfile"
+    $argList = "/quiet","/L*V $logfile" + $portalParams 
+    commonRunProcess "$setup_cmd" $argList
+    write-host $(get-date) TDMPortal installer logfile: $logfile 
+    
+    # Make sure portal installed ok - Look for shortcut on desktop
+    # If portal rolls back the shortcut will be missing
+    if (test-path $global:portal_shortcut) {
+        write-host TDMPortal installed ok
+    }
+    else {
+        write-host TDMPortal installer failed - Please see installer logfile for details
+        commonAutoInstallFail
+    } 
+}

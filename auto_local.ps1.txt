@@ -1,0 +1,211 @@
+#
+# Use this to install locally only. It expects the DB install kit and portal and gtserver installers to be co-located.
+#
+
+# Globals
+$global:vmProperties = convertfrom-stringdata (get-content .\VM.properties -raw)
+$global:auto_install_dir = (get-item .)
+$global:boot = (get-item .)
+$global:bootstrap = (get-item .)
+$global:repo_kit_folder = "CATDM-DBInstaller-*"
+$global:repo_kit = "CATDM-DBInstaller-*.zip"
+$global:gtserver = "setup_GTServer*.exe"
+$global:tdmportal = "setup_CA Test Data Manager Portal*.exe"
+$global:desktop = [Environment]::GetFolderPath("Desktop")
+$global:public_desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
+$global:portal_shortcut = "$global:public_desktop\Launch CA Test Data Manager Portal.url"
+$global:progress_filter = "Auto Install *.lnk"
+$global:progress_running = "Auto Install Running.lnk"
+$global:progress_failed = "Auto Install Failed.lnk"
+$global:progress_complete = "Auto Install Complete.lnk"
+
+# Source in the modules.
+. .\common_functions.ps1
+. .\auto_install_credentials.ps1
+
+# These functions seem like they ought to be common.
+
+FUNCTION installRepoKit($working_dir)
+{
+    if (test-path $working_dir) {
+        write-host Repo Kit already installed - Skipping
+        return
+    }
+
+    write-host -------------------
+    write-host Installing Repo Kit
+    write-host -------------------
+    New-Item -ItemType Directory -Path $working_dir | out-null
+
+    # Get repo kit (allow override with custom folder)
+    $latest_folder = get-childitem $global:auto_install_dir -Attributes Directory -filter $global:repo_kit_folder | sort CreationTime -Descending| select -first 1
+    if ("$latest_folder" -ne "") {
+    	$repo_kit = "$latest_folder\ca-tdm-db-install-kit"
+    } 
+    elseif (${global:vmProperties}.install_local.Contains("true")) {
+       	write-host Repo Kit Install cancelled due to missing local installer folder: $global:auto_install_dir\$global:repo_kit_folder
+       	commonAutoInstallFail
+    }
+    else {
+    	write-host Repo Kit Installer folder not found locally so checking for zips
+	    # Get repo kit zip file (allow override with custom version)
+    	$latest_zip = get-childitem $global:auto_install_dir -filter $global:repo_kit | sort CreationTime -Descending| select -first 1
+	    if ("$latest_zip" -ne "") {
+    	    write-host Using a custom Repo Kit
+            $repo_file = "$global:auto_install_dir\$latest_zip"
+    	}
+    	else {
+            $latest_zip = get-childitem $global:images -filter $global:repo_kit | sort CreationTime -Descending| select -first 1
+            $repo_file = "$global:images\$latest_zip"
+            if ("$latest_zip" -eq "") {
+                write-host Repo Kit Install cancelled due to missing zip file: $global:images\$global:repo_kit
+                commonAutoInstallFail
+            }
+    	}
+        commonGetRepoKit $latest_zip $repo_file $working_dir
+    	$repo_kit = "$working_dir\ca-tdm-db-install-kit"
+    }
+
+    commonInstallRepoKit $repo_kit
+#    commonInstallAdditionalData
+}
+
+
+FUNCTION installGTServer($working_dir)
+{
+    if (${global:vmProperties}.skip_gtserver_install.Contains("true")) {
+        write-host "VM property skip_gtserver_install is set to true"
+        write-host GTServer will not be installed - Skipping
+        return
+    }
+
+    if (test-path $working_dir) {
+        write-host GTServer already installed - Skipping
+        return
+    }
+
+    write-host -------------------
+    write-host Installing GTServer
+    write-host -------------------
+    New-Item -ItemType Directory -Path $working_dir | out-null
+	
+    # Allow override of GTServer with custom version
+    $gtserver_setup = get-childitem $global:auto_install_dir -filter $global:gtserver | sort CreationTime -Descending| select -first 1
+    if ("$gtserver_setup" -ne "") {
+        write-host Using a custom GTServer
+        write-host Copying $gtserver_file to $working_dir
+        # Why? copy-item "$gtserver_file" $working_dir
+	    $gtserver_file = "$global:auto_install_dir\$gtserver_setup"
+    }
+    elseif (${global:vmProperties}.install_local.Contains("true")) {
+        write-host GTServer Install cancelled due to missing file: $global:auto_install_dir\$global:gtserver
+    	commonAutoInstallFail
+    }
+    else {
+        # No override so find GA GTServer zip file
+        $zip_filter = "GEN*.zip"
+        $zip_files = get-childitem $global:ga_image -filter $zip_filter
+        foreach ($zip_file in $zip_files) {
+            $shell = New-Object -ComObject shell.application
+            $zip = $shell.NameSpace("$global:ga_image\$zip_file")
+            foreach ($item in $zip.items()) {
+                if ($item.Name -Like "setup_GTServer*.exe") {
+                    write-host Unzipping GTServer zip file: $zip_file
+                    $shell.Namespace($working_dir).CopyHere($item)
+                    $gtserver_setup = $item.Name
+                    break
+                }
+            }
+        }
+    
+        if ("$gtserver_setup" -eq "") {
+            write-host Could not find GTServer zip file: $global:ga_image\$zip_filter
+            commonAutoInstallFail
+        }
+        else {
+            $gtserver_file = "$working_dir\$gtserver_setup"
+        }
+    }
+    
+    commonInstallGTServer $working_dir "$gtserver_file"
+}
+
+
+FUNCTION installPortal($working_dir)
+{
+    if (${global:vmProperties}.skip_portal_install.Contains("true")) {
+        write-host "VM property skip_portal_install is set to true"
+        write-host TDMPortal will not be installed - Skipping
+        return
+    }
+
+    if (test-path $working_dir) {
+        write-host TDMPortal already installed - Skipping
+        return
+    }
+
+    write-host --------------------
+    write-host Installing TDMPortal
+    write-host --------------------
+    New-Item -ItemType Directory -Path $working_dir | out-null
+    
+    # Allow override of GTServer with custom version
+    $portal_setup = get-childitem $global:auto_install_dir -filter $global:tdmportal | sort CreationTime -Descending| select -first 1
+    if ("$portal_setup" -ne "") {
+        write-host Using a custom TDMPortal
+        write-host Copying $portal_file to $working_dir
+        # Why? copy-item $portal_file $working_dir
+	    $portal_file = "$global:auto_install_dir\$portal_setup"
+    }
+    elseif (${global:vmProperties}.install_local.Contains("true")) {
+        write-host PortalInstall cancelled due to missing file: $global:auto_install_dir\$global:tdmportal
+    	commonAutoInstallFail
+    }
+    else {
+        # No override so find TDMPortal zip file
+        $zip_filter = "GEN*.zip"
+        $zip_files = get-childitem $global:ga_image -filter $zip_filter
+        foreach ($zip_file in $zip_files) {
+            $shell = New-Object -ComObject shell.application
+            $zip = $shell.NameSpace("$global:ga_image\$zip_file")
+            foreach ($item in $zip.items()) {
+                if ($item.Name -Like "setup_CA Test Data Manager Portal*.exe") {
+                    write-host Unzipping TDMPortal zip file: $zip_file
+                    $shell.Namespace($working_dir).CopyHere($item)
+                    $portal_setup = $item.Name
+                    break
+                }
+            }
+        }
+    
+        if ("$portal_setup" -eq "") {
+            write-host Could not find TDMPortal zip file: $global:ga_image\$zip_filter
+            commonAutoInstallFail
+        }
+        else {
+            $portal_file = "$working_dir\$portal_setup"
+        }
+    }
+    
+    commonInstallPortal $working_dir "$portal_file"
+}
+
+# -------------------------------- MAIN ----------------------------
+
+commonAutoInstallStart
+
+write-host Using locally copied images: $Env:PWD
+
+commonLookForOracle
+if ($global:isOracle) {
+    write-host "Database is Oracle"
+}
+else {
+    write-host "Database is SQL Server"
+}
+
+installRepoKit $global:auto_install_dir\Repo_Kit_Auto_Installed
+installGTServer $global:auto_install_dir\GTServer_Auto_Installed
+installPortal $global:auto_install_dir\TDMPortal_Auto_Installed
+
+commonAutoInstallComplete
